@@ -35,10 +35,7 @@ class PoseSkeletonDataset(Dataset):
     
     def collate_fn(batch):
         sequences, labels = zip(*batch)
-        
-        # Pad sequences to have the same length in the batch
         padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0)
-        
         return padded_sequences, labels
         
 

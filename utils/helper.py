@@ -28,4 +28,4 @@ def load_config(path="./Configs/Base.yaml") -> dict:
     with open(path, 'r') as ymlfile:
         cfg = yaml.safe_load(ymlfile)
     return cfg
-    
+
