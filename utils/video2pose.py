@@ -12,11 +12,10 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
     :param out_path: Path to save the images with pose landmarks drawn
     :return: List of keypoints for each frame
     '''
-    keypoints_list = []
+    keypoints_list = [None] * len(image_files)
 
     mp_pose = mp.solutions.pose
     mp_hands = mp.solutions.hands
-    mp_face = mp.solutions.face_mesh
 
     pose = mp_pose.Pose(
         static_image_mode=True,
@@ -43,32 +42,29 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
         # Convert the BGR image to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pose_results = pose.process(rgb_frame)
-        pose_keypoints = []
+        pose_keypoints = [(None, None)] * 19
+        pose_index = 0
         if pose_results.pose_landmarks:
             for idx, landmark in enumerate(pose_results.pose_landmarks.landmark):
                 if idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 23, 24]:  # Specific body keypoints
-                    pose_keypoints.append((landmark.x, landmark.y))
+                    pose_keypoints[pose_index]=(landmark.x, landmark.y)
+                    pose_index+=1
 
         # Process hand keypoints
         hand_results = hands.process(rgb_frame)
-        left_hand_keypoints = []
-        right_hand_keypoints = []
-        if hand_results.multi_hand_landmarks:
-            for hand_landmarks in hand_results.multi_hand_landmarks:
-                hand_keypoints = []
-                for landmark in hand_landmarks.landmark:
-                    hand_keypoints.append((landmark.x, landmark.y))
-                if len(left_hand_keypoints) == 0:
+        left_hand_keypoints = [(None, None)] * 21
+        right_hand_keypoints = [(None, None)] * 21
+        if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
+            for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
+                hand_keypoints = [(landmark.x, landmark.y) for landmark in hand_landmarks.landmark]
+                label = handedness.classification[0].label
+                if label == "Left":
                     left_hand_keypoints = hand_keypoints
                 else:
                     right_hand_keypoints = hand_keypoints
 
         # Combine all keypoints
         all_keypoints = left_hand_keypoints[:21] + right_hand_keypoints[:21] + pose_keypoints
-        # Subsample frames (process every 3rd image)
-        if (i + 1) % 3 == 0:
-            continue
-
         keypoints_list.append(all_keypoints)
 
         if draw:
@@ -77,7 +73,31 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
             # Draw pose landmarks on the image
             draw_pose_landmarks(out_path, mp_drawing, mp_pose, i+1, frame, pose_results, hand_results)
 
+    # # Interpolate missing keypoints across the sequence
+    # last_valid_idx = None
+    # for i in range(len(keypoints_list)):
+    #     if (None, None) in keypoints_list[i]:
+    #         if i == 0:
+            
+    #         elif i == len(keypoints_list) - 1:
+    #         # Interpolate if there was a missing segment
+    #         if last_valid_idx is not None and last_valid_idx < i - 1:
+    #             interpolate_keypoints(last_valid_idx, i, keypoints_list)
+    #         last_valid_idx = i
+
     return keypoints_list
+
+def interpolate_keypoints(start_idx, end_idx, keypoints_list):
+    """Interpolate missing frames between two valid frames."""
+    start_keypoints = keypoints_list[start_idx]
+    end_keypoints = keypoints_list[end_idx]
+    for j in range(start_idx + 1, end_idx):
+        t = (j - start_idx) / (end_idx - start_idx)
+        interpolated_keypoints = [
+            ((1 - t) * start + t * end) if start and end else (None, None)
+            for start, end in zip(start_keypoints, end_keypoints)
+        ]
+        keypoints_list[j] = interpolated_keypoints
 
 def draw_pose_landmarks(out_path, mp_drawing, mp_pose, i, frame, pose_results, hand_results):
     '''
@@ -119,42 +139,22 @@ def draw_pose_landmarks(out_path, mp_drawing, mp_pose, i, frame, pose_results, h
     cv2.imwrite(out_path + str(i) + '.png', annotated_image)
     print(f"drawn {i} frames")
 
-def calculate_angles(keypoints):
-    '''
-    Calculates the angle between three keypoints (shoulder, elbow, wrist) for each frame.
-    :param keypoints: List of keypoints for each frame
-    :return: List of angles for each frame
-    '''
-    angles = []
-    # Calculate angle between three keypoints (shoulder, elbow, wrist)
-    for frame_keypoints in keypoints:
-        if len(frame_keypoints) >= 14:  # Ensure we have enough points
-            shoulder = np.array(frame_keypoints[11])  # Left shoulder
-            elbow = np.array(frame_keypoints[13])  # Left elbow
-            wrist = np.array(frame_keypoints[15])  # Left wrist
-            
-            # Calculate angle using vector math
-            vector1 = elbow - shoulder
-            vector2 = wrist - elbow
-            angle = np.arctan2(vector2[1], vector2[0]) - np.arctan2(vector1[1], vector1[0])
-            angle = np.abs(angle * (180.0 / np.pi))  # Convert to degrees
-            angles.append(angle)
-
-    return angles
-
-
 if __name__ == "__main__":
     # Example usage
     folder_path = './trail_vid/'
-    # Set draw to True to visualize the pose landmarks, false to only extract keypoints
-    keypoints = extract_keypoints_from_folder(folder_path, draw=True)
-    angles = calculate_angles(keypoints)
+    image_files = sorted(os.listdir(folder_path))
+    keypoints = extract_keypoints_from_folder(image_files)
 
-    # # Output the results
-    print("Extracted Keypoints:")
-    for i, frame_keypoints in enumerate(keypoints):
-        print(f"Frame {i + 1}: {len(frame_keypoints)}")
-
-    # print("\nCalculated Angles:")
-    # for i, angle in enumerate(angles):
-    #     print(f"Frame {i + 1}: {angle:.2f} degrees")
+    # for i, frame_keypoints in enumerate(keypoints):
+    #     image = cv2.imread(os.path.join(folder_path, image_files[i]))
+    #     for x, y in frame_keypoints:
+    #         if x is None or y is None:
+    #             continue  # Skip missing points
+    #         # Draw each keypoint as a small circle
+    #         image = cv2.circle(image, (int(x * image.shape[1]), int(y * image.shape[0])), radius=5, color=(0, 255, 0), thickness=-1)
+    #         cv2.imwrite("./trail_pose/" + str(i) + '.png', image)
+    #         print(f"drawn {i} frames")
+    # Output the results
+    # print("Extracted Keypoints:")
+    # for i, frame_keypoints in enumerate(keypoints):
+    #     print(f"Frame {i + 1}: {len(frame_keypoints)}")
