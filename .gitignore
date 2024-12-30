@@ -1,3 +1,6 @@
 Dataset
 utils/trail_pose
 utils/trail_vid
+__pycache__/
+**/__pycache__/
+**/trail_vid/

@@ -1,142 +1,176 @@
 import torch
 import torch.nn as nn
-from torch import Tensor
-import torch.nn.functional as F
 import networkx as nx
 import copy
 import numpy as np
+import os
+import matplotlib.pyplot as plt
+from utils.video2pose import extract_keypoints_from_folder
+from utils.helper import create_graph
+from torch.nn import Module
 
-def create_mediapipe_hand_graph():
-    # Create a graph for 21 keypoints per hand, totaling 42 nodes.
-    graph = nx.Graph()
-    graph.add_nodes_from(range(42))  # 42 nodes for both hands
-    
-    # Define edges based on MediaPipe keypoint connections for a single hand
-    hand_edges = [
-        (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-        (0, 5), (5, 6), (6, 7), (7, 8),  # Index
-        (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
-        (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-        (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
-    ]
-    
-    # Add edges for both hands (21 nodes each)
-    for hand in range(2):
-        offset = hand * 21
-        for edge in hand_edges:
-            graph.add_edge(edge[0] + offset, edge[1] + offset)
-    
-    return graph
 
-class GraphPyramid:
-    def __init__(self, skeleton_graph):
-        # Store the original skeleton graph and build an initial pyramid with only the original graph
-        self.original_graph = skeleton_graph.copy()
-        self.current = self.original_graph.copy()
+def downsample_graph(graph):
+    """
+    Downsample the graph.
+    Removes nodes systematically while preserving connectivity.
+    """
+    nodes = list(graph.nodes)
+    downsampled_nodes = nodes[::2]
+    downsampled_graph = nx.Graph()
+    downsampled_graph.add_nodes_from(downsampled_nodes)
 
-    def downsample_graph(graph):
-        """
-        Downsample the graph by one level, removing nodes while updating position information to maintain spatial coherence.
-        Args:
-            graph (networkx.Graph): The graph to downsample, with nodes having "position" attributes (x, y coordinates).
-        Returns:
-            networkx.Graph: The downsampled graph after one level, with updated positions.
-        """
-        downsampled_graph = graph.copy()
-        nodes_to_remove = []
+    # Add edges to preserve connectivity
+    for u in downsampled_nodes:
+        for v in downsampled_nodes:
+            if u != v and nx.has_path(graph, u, v):
+                path = nx.shortest_path(graph, u, v)
+                if len(path) == 2:  # Direct neighbors
+                    downsampled_graph.add_edge(u, v)
 
-        for node in list(downsampled_graph.nodes):
-            if len(downsampled_graph[node]) > 1:
-                neighbors = list(downsampled_graph.neighbors(node))
-                nodes_to_remove.append(node)
-                
-                # Calculate the average position of the neighboring nodes to replace the removed node's position
-                avg_position = np.mean([downsampled_graph.nodes[neighbor]["position"] for neighbor in neighbors], axis=0)
-                
-                # Assign the averaged position to one of the neighbors (or spread among neighbors)
-                for neighbor in neighbors:
-                    downsampled_graph.nodes[neighbor]["position"] = avg_position
-                
-                # Add edges between neighbors to preserve connectivity
-                downsampled_graph.add_edges_from((neighbor, n) for neighbor in neighbors for n in neighbors if n != neighbor)
-                downsampled_graph.remove_node(node)
+    return downsampled_graph
 
-        return downsampled_graph
 
-# Graph Convolution Layer
-class GraphConvLayer(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(GraphConvLayer, self).__init__()
-        self.fc = nn.Linear(in_features, out_features)
-        self.relu = nn.ReLU()
+def upsample_graph(coarse_graph, fine_graph):
+    """
+    Upsample the graph by interpolating features for finer nodes.
+    """
+    upsampled_graph = nx.Graph()
+    upsampled_graph.add_nodes_from(fine_graph.nodes)
 
-    def forward(self, x, adj):
-        h = torch.matmul(adj, x)  # Apply adjacency matrix to input
-        h = self.fc(h)
-        return self.relu(h)
+    for u, v in fine_graph.edges:
+        if u in coarse_graph.nodes and v in coarse_graph.nodes:
+            upsampled_graph.add_edge(u, v)  # Retain original edges
+        elif u in coarse_graph.nodes or v in coarse_graph.nodes:
+            # Add interpolated edges for finer nodes
+            upsampled_graph.add_edge(u, v)
+
+    return upsampled_graph
+
 
 class STGPBlock(nn.Module):
-    def __init__(self, in_features, out_features, graph_pyramid):
+    def __init__(self, in_channels, out_channels, base_graph, levels, kernel_size=3, stride=1, padding=1):
         super(STGPBlock, self).__init__()
-        self.input_projection = nn.Linear(in_features, out_features)
-        self.graph_conv = GraphConvLayer(in_features, out_features)
-        self.temporal_conv = nn.Conv1d(out_features, out_features, kernel_size=1)  # Temporal 1x1 Convolution
-        self.batch_norm = nn.BatchNorm1d(out_features)
-        self.relu = nn.ReLU()
-        self.graph_pyramid = graph_pyramid
+        self.levels = levels
+        self.base_graph = base_graph
+
+        # Build graph pyramid
+        self.graph_pyramid = self.build_graph_pyramid(base_graph, levels)
+
+        # Spatial graph convolutions at each level
+        self.spatial_convs = nn.ModuleList([
+            self.create_spatial_conv(in_channels if i == 0 else out_channels, out_channels, nx.to_numpy_array(g))
+            for i, g in enumerate(self.graph_pyramid)
+        ])
+
+        # Temporal convolution
+        self.temporal_conv = nn.Conv1d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding
+        )
+
+        # Residual connection
+        self.residual = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1
+        ) if in_channels != out_channels else nn.Identity()
+
+    def build_graph_pyramid(self, base_graph, levels):
+        """
+        Build a pyramid of downsampled graphs.
+        """
+        pyramid = [base_graph]
+        current_graph = base_graph
+        for _ in range(levels - 1):
+            downsampled_graph = downsample_graph(current_graph)
+            pyramid.append(downsampled_graph)
+            current_graph = downsampled_graph
+        return pyramid
+
+    def create_spatial_conv(self, in_channels, out_channels, adjacency_matrix):
+        """
+        Create a spatial convolution for a specific adjacency matrix.
+        """
+        adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float32)
+        return nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            nn.ReLU(),
+            lambda x: torch.matmul(adjacency_matrix.to(x.device), x)
+        )
 
     def forward(self, x):
-        # Obtain the downsampled graph and adjacency matrix
-        downsampled_graph = self.graph_pyramid.downsample()
-        adj_matrix = torch.tensor(nx.to_numpy_array(downsampled_graph), dtype=torch.float32)
-        
-        # Select only the features corresponding to the nodes in the downsampled graph
-        downsampled_nodes = list(downsampled_graph.nodes)
-        x = x[downsampled_nodes]  # Match x to the downsampled graph's nodes
+        """
+        Forward pass through the STGP block.
+        x: Tensor of shape (batch_size, num_nodes, time_steps, in_channels)
+        """
+        batch_size, num_nodes, time_steps, in_channels = x.size()
+        x = x.permute(0, 3, 1, 2)  # (batch_size, in_channels, num_nodes, time_steps)
 
-        x_proj = self.input_projection(x)
+        # Apply spatial convolutions at each level of the pyramid
+        for spatial_conv in self.spatial_convs:
+            x = spatial_conv(x)
 
-        # Graph
-        out = self.graph_conv(x_proj, adj_matrix)
-        
-        # Temporal
-        out = out.permute(1, 0).unsqueeze(0)  # Prepare for temporal convolution (batch, channel, time)
-        out = self.batch_norm(self.temporal_conv(out)).squeeze(0).permute(1, 0)
+        # Apply temporal convolution
+        x = self.temporal_conv(x.permute(0, 2, 3, 1))  # (batch_size, time_steps, num_nodes, out_channels)
 
-        return out + x_proj
+        # Residual connection
+        x_residual = self.residual(x)
+        return x + x_residual
 
-class STGPNetwork(nn.Module):
-    def __init__(self, num_blocks, in_features, out_features, base_pyramid):
-        super(STGPNetwork, self).__init__()
+class STGPEncoder(nn.Module):
+    def __init__(self, in_channels, out_channels, base_graph, num_blocks):
+        super(STGPEncoder, self).__init__()
         self.blocks = nn.ModuleList([
-            STGPBlock(in_features, out_features, base_pyramid) for _ in range(num_blocks)
+            STGPBlock(
+                in_channels=in_channels if i == 0 else out_channels,
+                out_channels=out_channels,
+                base_graph=base_graph,
+                levels=num_blocks
+            )
+            for i in range(num_blocks)
         ])
 
     def forward(self, x):
         for block in self.blocks:
-            block.graph_pyramid.reset()
-
-        for block in self.blocks:
             x = block(x)
-
         return x
 
-# Example Usage with MediaPipe Structure
-if __name__ == "__main__":
-    # Initialize the graph with MediaPipe hand keypoints
-    mediapipe_hand_graph = create_mediapipe_hand_graph()
-    base_pyramid = GraphPyramid(mediapipe_hand_graph)
-    
-    # Define input tensors and model
-    num_blocks = 3
-    in_features, out_features = 2, 32  # V=42, C=2 for 2D data; adjust C if using 3D data
-    stgp_network = STGPNetwork(num_blocks, in_features, out_features, base_pyramid)
 
-    x = torch.randn(42, in_features)
+class STGPDecoder(nn.Module):
+    def __init__(self, in_channels, out_channels, base_graph, num_blocks):
+        super(STGPDecoder, self).__init__()
+        self.blocks = nn.ModuleList([
+            STGPBlock(
+                in_channels=in_channels if i == 0 else out_channels,
+                out_channels=out_channels,
+                base_graph=base_graph,
+                levels=num_blocks
+            )
+            for i in range(num_blocks)
+        ])
 
-    # Forward pass through STGP Network
-    output = stgp_network(x)
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
 
-    print("STGP Network output shape:", output.shape)
 
+if __name__=="__main__":
+    # Run  python -m models.STGP  from project root
+    folder_path = './models/trail_vid/'
+    image_files = sorted(os.listdir(folder_path))
+    keypoints = extract_keypoints_from_folder(folder_path, image_files)
+    keypoints = [tuple(k) for k in keypoints]
+    base_graph = create_graph(keypoints)
 
+    downsampled_graph = downsample_graph(base_graph)
+    print(f"Original graph: {len(base_graph.nodes)} nodes, {len(base_graph.edges)} edges")
+    print(f"Downsampled graph: {len(downsampled_graph.nodes)} nodes, {len(downsampled_graph.edges)} edges")
+
+    # Test upsample_graph function
+    upsampled_graph = upsample_graph(downsampled_graph, base_graph)
+    print(f"Upsampled graph: {len(upsampled_graph.nodes)} nodes, {len(upsampled_graph.edges)} edges")

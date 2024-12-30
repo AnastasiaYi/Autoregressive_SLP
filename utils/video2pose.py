@@ -4,9 +4,9 @@ import numpy as np
 import os
 
 
-def extract_keypoints_from_folder(image_files, transform = None, draw=False, out_path="./trail_pose/"):
+def extract_keypoints_from_folder(folder_path, image_files, transform = None, draw=False, out_path="./trail_pose/"):
     '''
-    Employ Mediapipe to extract 61 2D keypoints (comprised of 21 for each hand, 9 for the body, and 10 for the face)
+    Employ Mediapipe to extract 59 2D keypoints (comprised of 21 for each hand, 7 for the body, and 10 for the face)
     :param folder_path: Path to the folder containing images
     :param draw: Whether to draw the pose landmarks on the images
     :param out_path: Path to save the images with pose landmarks drawn
@@ -33,6 +33,7 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
         file_path = os.path.join(folder_path, file_name)
         # Read the image
         frame = cv2.imread(file_path)
+        height, width, _ = frame.shape
         if frame is None:
             continue
 
@@ -42,12 +43,12 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
         # Convert the BGR image to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pose_results = pose.process(rgb_frame)
-        pose_keypoints = [(None, None)] * 19
+        pose_keypoints = [(None, None)] * 17
         pose_index = 0
         if pose_results.pose_landmarks:
             for idx, landmark in enumerate(pose_results.pose_landmarks.landmark):
-                if idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 23, 24]:  # Specific body keypoints
-                    pose_keypoints[pose_index]=(landmark.x, landmark.y)
+                if idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 23, 24]:  # Specific body keypoints
+                    pose_keypoints[pose_index]=(landmark.x * width, landmark.y * height)
                     pose_index+=1
 
         # Process hand keypoints
@@ -56,7 +57,7 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
         right_hand_keypoints = [(None, None)] * 21
         if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
             for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
-                hand_keypoints = [(landmark.x, landmark.y) for landmark in hand_landmarks.landmark]
+                hand_keypoints = [(landmark.x * width, landmark.y * height) for landmark in hand_landmarks.landmark]
                 label = handedness.classification[0].label
                 if label == "Left":
                     left_hand_keypoints = hand_keypoints
@@ -65,7 +66,7 @@ def extract_keypoints_from_folder(image_files, transform = None, draw=False, out
 
         # Combine all keypoints
         all_keypoints = left_hand_keypoints[:21] + right_hand_keypoints[:21] + pose_keypoints
-        keypoints_list.append(all_keypoints)
+        keypoints_list[i] = all_keypoints
 
         if draw:
             if not os.path.exists(out_path):
@@ -143,7 +144,7 @@ if __name__ == "__main__":
     # Example usage
     folder_path = './trail_vid/'
     image_files = sorted(os.listdir(folder_path))
-    keypoints = extract_keypoints_from_folder(image_files)
+    keypoints = extract_keypoints_from_folder(folder_path, image_files, draw=True)
 
     # for i, frame_keypoints in enumerate(keypoints):
     #     image = cv2.imread(os.path.join(folder_path, image_files[i]))
