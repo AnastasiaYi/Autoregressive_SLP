@@ -1,22 +1,22 @@
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 from utils.helper import load_config
-from utils.dataset import PoseSkeletonDataset
-from utils.loss import Loss
 
-class Stage1Trainer:
-    def __init__(self, dataset, model, cfg_path="./Configs/Base.yaml", device='gpu'):
+class TrainerStage1:
+    def __init__(self, dataset, encoder, decoder, codebook, cfg_path="./Configs/Base.yaml", device='gpu'):
         cfg=load_config(cfg_path)
-        self.model = model.to(device)
+        self.encoder = encoder.to(device)
+        self.decoder = decoder.to(device)
+        self.codebook = codebook.to(device)
         self.device = device
         self.num_epochs = cfg['epochs']
         self.batch_size = cfg['batch_size']
         self.learning_rate = cfg['learning_rate']
         self.dataset = dataset
-        self.loss_list = Loss(cfg['loss'])
         self.alpha = cfg['alpha']
         self.beta = cfg['beta']
 
@@ -26,49 +26,37 @@ class Stage1Trainer:
         
         # Optimizer
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-    
-    def collate_fn(self, batch):
-        """
-        Custom collate function to pad sequences within a batch to the same length.
-        """
-        sequences = [item for item in batch]
-        padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0)
-        return padded_sequences.to(self.device)
+        # Loss
+        self.criterion_reconstruction = nn.MSELoss()
+        self.criterion_diversity = nn.CrossEntropyLoss()
 
     def train_epoch(self):
-        """
-        Train the model for one epoch and return the average loss.
-        """
-        self.model.train()
-        epoch_loss = 0
-        for batch_idx, batch in enumerate(tqdm(self.dataloader, desc="Training")):
+        self.encoder.train()
+        self.decoder.train()
+        self.codebook.train()
+
+        epoch_loss = 0.0
+        for batch in self.dataloader:
+            batch = batch.to(self.device)
             self.optimizer.zero_grad()
-            
-            # Forward pass
-            reconstructed, mu, logvar = self.model(batch)
-            
-            # Compute loss
-            # TODO: Implement the loss function
-            epoch_loss += loss.item()
-            
-            # Backward pass and optimization
+
+            encoded = self.encoder(batch)
+            quantized, soft_assignment = self.codebook(encoded)
+            reconstructed = self.decoder(quantized)
+
+            reconstruction_loss = self.criterion_reconstruction(reconstructed, batch)
+            diversity_loss = -torch.sum(soft_assignment * torch.log(soft_assignment + 1e-6)) / batch.size(0)
+
+            loss = reconstruction_loss + 0.1 * diversity_loss  # Adjust diversity weight as needed
+
             loss.backward()
             self.optimizer.step()
-        
+
+            epoch_loss += loss.item()
+
         return epoch_loss / len(self.dataloader)
-    
-    def train(self):
-        """
-        Perform the training over the specified number of epochs.
-        """
-        for epoch in range(self.num_epochs):
-            avg_loss = self.train_epoch()
-            print(f"Epoch [{epoch + 1}/{self.num_epochs}], Loss: {avg_loss:.4f}")
-        print("Training complete.")
 
-# Usage example:
-# Assuming `vae_model` is an instance of your VAE model and `pose_skeleton_dataset` is the dataset.
-# trainer = Trainer(model=vae_model, dataset=pose_skeleton_dataset, batch_size=16, learning_rate=1e-3, num_epochs=10, device='cuda')
-# trainer.train()
-
-
+    def train(self, num_epochs):
+        for epoch in range(num_epochs):
+            epoch_loss = self.train_epoch()
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")

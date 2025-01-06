@@ -8,6 +8,16 @@ import matplotlib.pyplot as plt
 from utils.video2pose import extract_keypoints_from_folder
 from utils.helper import create_graph
 from torch.nn import Module
+import torch.nn.functional as F
+
+
+############################################################################################################
+# 
+# 06-01-2025
+#TODO: Change tpye of graph to torch_geometric graph
+# 
+############################################################################################################
+
 
 
 def downsample_graph(graph):
@@ -157,6 +167,35 @@ class STGPDecoder(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+
+class Codebook(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, tau=0.1):
+        super(Codebook, self).__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.tau = tau
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+
+    def forward(self, z_e):
+        # Flatten the input
+        z_e_flat = z_e.view(-1, self.embedding_dim)
+        
+        # Compute logits for the Gumbel-Softmax
+        logits = F.linear(z_e_flat, self.embedding.weight)
+        
+        # Apply Gumbel-Softmax
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits)))
+        gumbel_logits = (logits + gumbel_noise) / self.tau
+        soft_assignment = F.softmax(gumbel_logits, dim=-1)
+        
+        # Quantize to the nearest embedding
+        hard_assignment = F.one_hot(soft_assignment.argmax(dim=-1), self.num_embeddings).float()
+        quantized = torch.matmul(hard_assignment, self.embedding.weight)
+        
+        # Reshape to original dimensions
+        quantized = quantized.view(*z_e.shape)
+        
+        return quantized, soft_assignment
 
 
 if __name__=="__main__":

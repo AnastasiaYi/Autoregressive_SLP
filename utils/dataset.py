@@ -9,6 +9,8 @@ from video2pose import extract_keypoints_from_folder
 from helper import get_annotation_by_folder
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
+from utils.helper import create_graph
+from torch_geometric.utils.convert import from_networkx
 
 class PoseSkeletonDataset(Dataset):
     def __init__(self, root_dir, annotation_path=None, transform=None):
@@ -24,14 +26,16 @@ class PoseSkeletonDataset(Dataset):
         video_path = self.video_folders[idx]
         image_files = sorted(os.listdir(video_path))
 
-        keypoints = extract_keypoints_from_folder(image_files, transform=self.transform) #0-20: Left hand, 21-41: Right hand, 42-52: Face, 53-61: Body)
-        skeleton_sequence = torch.stack(keypoints)
+        keypoints = extract_keypoints_from_folder(image_files, transform=self.transform) #17 for body, 21 for left hand and 21 for right hand.
+        keypoints = [tuple(k) for k in keypoints]
+        base_graph = create_graph(keypoints)
+        torch_graph = from_networkx(base_graph)
 
         if self.annotation_path:
             label = get_annotation_by_folder(video_path, self.annotation_path)
-            return skeleton_sequence, label
+            return torch_graph, label
         
-        return skeleton_sequence # Shape: (sequence_length, keypoint_dim)
+        return torch_graph
     
     def collate_fn(batch):
         sequences, labels = zip(*batch)
